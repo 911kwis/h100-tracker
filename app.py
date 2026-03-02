@@ -187,6 +187,10 @@ if selected_providers:
     gpu_data = gpu_data[gpu_data["provider"].isin(selected_providers)]
 
 nvda_data = load_nvda_prices(start_date=start_date.isoformat()) if show_nvda else pd.DataFrame()
+# Normalize column names (SQLite stores lowercase, yfinance uses Title case)
+if not nvda_data.empty:
+    nvda_data.columns = [c.title() for c in nvda_data.columns]
+
 
 price_col = "price_per_gpu_hour" if price_metric == "Price per GPU/hr" else "price_per_hour"
 price_label = "$/GPU/hr" if price_metric == "Price per GPU/hr" else "$/hr (total)"
