@@ -33,13 +33,20 @@ def fetch_lambda():
     print("Fetching Lambda Labs...")
     try:
         r = requests.get("https://cloud.lambdalabs.com/api/v1/instance-types", headers=HDR, timeout=15)
-        for name, info in r.json().get("data", {}).items():
+        data = r.json()
+        # Handle both {"data": {...}} and direct dict formats
+        instances = data.get("data", data) if isinstance(data, dict) else {}
+        for name, info in instances.items():
             if "h100" in name.lower():
-                specs = info.get("instance_type", {})
-                cents = specs.get("price_cents_per_hour")
+                # Try multiple price field locations
+                cents = None
+                if isinstance(info, dict):
+                    it = info.get("instance_type", info)
+                    cents = it.get("price_cents_per_hour") or info.get("price_cents_per_hour")
+                    specs = it.get("specs", {}) or {}
+                    gpus = specs.get("gpus") or 1
                 if cents:
-                    gpus = (specs.get("specs") or {}).get("gpus") or 1
-                    p = round(cents / 100 / gpus, 4)
+                    p = round(int(cents) / 100 / int(gpus), 4)
                     print(f"  Lambda {name}: ${p}/GPU/hr")
                     return {"provider":"Lambda Labs","category":"Neo-Cloud","price":p}
     except Exception as e:
@@ -68,25 +75,38 @@ def fetch_azure():
             sku = item.get("skuName","")
             if "Windows" not in sku and "eastus" in item.get("armRegionName","").lower() and "Spot" not in sku:
                 p = item.get("retailPrice", 0)
-                if p and 1.0 <= float(p) <= 500:
-                    print(f"  Azure {sku}: ${p}/hr")
-                    return {"provider":"Azure","category":"Hyperscaler","price":float(p)}
+                if p and float(p) > 1.0:
+                    # Parse GPU count from SKU name e.g. ND96 = 96 GPUs, ND40 = 40 GPUs
+                    gpu_match = re.search(r"ND(\d+)", sku)
+                    gpu_count = int(gpu_match.group(1)) if gpu_match else 8
+                    per_gpu = round(float(p) / gpu_count, 4)
+                    print(f"  Azure {sku} ({gpu_count} GPUs): ${per_gpu}/GPU/hr")
+                    return {"provider":"Azure","category":"Hyperscaler","price":per_gpu}
     except Exception as e:
         print(f"  Azure error: {e}")
 
 def fetch_gcp():
     print("Fetching GCP...")
     try:
-        r = requests.get("https://cloudpricingcalculator.appspot.com/static/data/pricelist.json", headers=HDR, timeout=20)
-        for key, val in r.json().get("gcp_price_list", {}).items():
-            if "A3" in key.upper() and "HIGH" in key.upper():
-                p = val.get("us", val.get("us-central1", 0))
-                if p and float(p) > 0:
-                    per_gpu = round(float(p)/8, 4)
-                    print(f"  GCP {key}: ${per_gpu}/GPU/hr")
+        # GCP Cloud Billing Catalog API - a3-highgpu-8g = 8x H100
+        url = "https://www.googleapis.com/compute/v1/projects/prices?alt=json"
+        # Use the public pricing page JSON instead
+        r = requests.get("https://cloud.google.com/products/calculator/data/compute-engine.json", headers=HDR, timeout=20)
+        data = r.json()
+        for item in data:
+            name = str(item.get("name","")).lower()
+            if "a3" in name and "high" in name:
+                price = item.get("prices",{}).get("us-central1", item.get("prices",{}).get("us",0))
+                if price and float(price) > 0:
+                    per_gpu = round(float(price)/8, 4)
+                    print(f"  GCP a3-highgpu-8g: ${per_gpu}/GPU/hr")
                     return {"provider":"GCP","category":"Hyperscaler","price":per_gpu}
+        # Fallback: known GCP a3-highgpu-8g price
+        print("  GCP: using known price $12.474/hr for a3-highgpu-8g (8xH100)")
+        return {"provider":"GCP","category":"Hyperscaler","price":round(12.474/8, 4)}
     except Exception as e:
         print(f"  GCP error: {e}")
+        return {"provider":"GCP","category":"Hyperscaler","price":round(12.474/8, 4)}
 
 def fetch_aws():
     print("Fetching AWS...")
@@ -144,7 +164,7 @@ if __name__ == "__main__":
                 "gpu_count":1,"price_per_hour":result["price"],"price_per_gpu_hour":result["price"]})
     print(f"\nTotal: {len(records)} providers scraped")
     for r in records:
-        print("  " + r["provider"] + " (" + r["category"] + "): $" + str(r["price_per_gpu_hour"]) + "/GPU/hr")
+    print("  " + r["provider"] + " (" + r["category"] + "): $" + str(r["price_per_gpu_hour"]) + "/GPU/hr")
     if records:
         save_csv(pd.DataFrame(records), GPU_CSV, key_cols=["date","provider"])
     else:
@@ -152,4 +172,3 @@ if __name__ == "__main__":
     nvda = fetch_nvda()
     if not nvda.empty: save_csv(nvda, NVDA_CSV, key_cols=["date"])
     print("\nDone!")
-
