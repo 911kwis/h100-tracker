@@ -152,3 +152,4 @@ if __name__ == "__main__":
     nvda = fetch_nvda()
     if not nvda.empty: save_csv(nvda, NVDA_CSV, key_cols=["date"])
     print("\nDone!")
+
