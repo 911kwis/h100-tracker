@@ -164,6 +164,7 @@ if __name__ == "__main__":
                 "gpu_count":1,"price_per_hour":result["price"],"price_per_gpu_hour":result["price"]})
     print(f"\nTotal: {len(records)} providers scraped")
     for r in records:
+        pass
     if records:
         save_csv(pd.DataFrame(records), GPU_CSV, key_cols=["date","provider"])
     else:
