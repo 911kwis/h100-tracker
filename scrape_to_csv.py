@@ -1,31 +1,19 @@
 """
 scrape_to_csv.py — Run by GitHub Actions daily.
-Scrapes silicon.fail for H100 prices and fetches NVDA stock data.
-Appends new rows to data/gpu_prices.csv and data/nvda_prices.csv.
+Uses Playwright to render JavaScript and scrape H100 prices from silicon.fail.
 """
 
-import requests
-from bs4 import BeautifulSoup
 import pandas as pd
 from pathlib import Path
-from datetime import date, datetime
+from datetime import date
 import re
 import yfinance as yf
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-TARGET_URL = "https://silicon.fail"
 DATA_DIR = Path("data")
 GPU_CSV = DATA_DIR / "gpu_prices.csv"
 NVDA_CSV = DATA_DIR / "nvda_prices.csv"
 TODAY = date.today().isoformat()
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
-}
+TARGET_URL = "https://silicon.fail"
 
 HYPERSCALERS = {"aws", "azure", "gcp", "google", "amazon", "microsoft"}
 NEO_CLOUDS = {
@@ -35,39 +23,34 @@ NEO_CLOUDS = {
     "shadeform", "novita", "ori", "cirrascale", "scaleway"
 }
 
-
-def classify_provider(name: str) -> str:
+def classify_provider(name):
     n = name.lower()
     for h in HYPERSCALERS:
-        if h in n:
-            return "Hyperscaler"
+        if h in n: return "Hyperscaler"
     for c in NEO_CLOUDS:
-        if c in n:
-            return "Neo-Cloud"
+        if c in n: return "Neo-Cloud"
     return "Neo-Cloud"
 
-
-# ── Scrape GPU prices ──────────────────────────────────────────────────────────
-def scrape_gpu_prices() -> pd.DataFrame:
-    print(f"Fetching {TARGET_URL}...")
-    try:
-        resp = requests.get(TARGET_URL, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"ERROR fetching page: {e}")
-        return pd.DataFrame()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    records = []
+def scrape_with_playwright():
+    from playwright.sync_api import sync_playwright
+    from bs4 import BeautifulSoup
     price_re = re.compile(r"\$?([\d]+\.[\d]{1,4})")
-
-    # Strategy 1: tables
+    records = []
+    print(f"Launching browser to fetch {TARGET_URL}...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(TARGET_URL, wait_until="networkidle", timeout=30000)
+        page.wait_for_timeout(3000)
+        html = page.content()
+        browser.close()
+    print("Page loaded, parsing...")
+    soup = BeautifulSoup(html, "html.parser")
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
         for row in rows[1:]:
             cells = row.find_all(["td", "th"])
-            if len(cells) < 2:
-                continue
+            if len(cells) < 2: continue
             cell_texts = [c.get_text(strip=True) for c in cells]
             price = None
             provider = None
@@ -83,42 +66,22 @@ def scrape_gpu_prices() -> pd.DataFrame:
                 if re.match(r"^\d+$", text) and 1 <= int(text) <= 512:
                     gpu_count = int(text)
             if price and provider and len(provider) > 1:
-                if any(s in provider.lower() for s in ["provider", "cloud", "name", "vendor"]):
-                    continue
-                records.append({
-                    "date": TODAY,
-                    "provider": provider,
-                    "category": classify_provider(provider),
-                    "gpu_count": gpu_count,
-                    "price_per_hour": price,
-                    "price_per_gpu_hour": round(price / gpu_count, 4),
-                })
-
-    # Strategy 2: text scan fallback
+                if any(s in provider.lower() for s in ["provider","cloud","name","vendor","#"]): continue
+                records.append({"date": TODAY, "provider": provider, "category": classify_provider(provider),
+                    "gpu_count": gpu_count, "price_per_hour": price, "price_per_gpu_hour": round(price/gpu_count,4)})
     if not records:
         print("No tables found, trying text scan...")
         lines = soup.get_text("\n").splitlines()
         for i, line in enumerate(lines):
             m = price_re.search(line)
-            if not m:
-                continue
+            if not m: continue
             price = float(m.group(1))
-            if not (0.5 <= price <= 500):
-                continue
+            if not (0.5 <= price <= 500): continue
             provider_line = line.replace(m.group(0), "").strip(" |$\t-")
-            if not provider_line and i > 0:
-                provider_line = lines[i - 1].strip()
+            if not provider_line and i > 0: provider_line = lines[i-1].strip()
             if provider_line and 1 < len(provider_line) < 60:
-                records.append({
-                    "date": TODAY,
-                    "provider": provider_line,
-                    "category": classify_provider(provider_line),
-                    "gpu_count": 8,
-                    "price_per_hour": price,
-                    "price_per_gpu_hour": round(price / 8, 4),
-                })
-
-    # Deduplicate
+                records.append({"date": TODAY, "provider": provider_line, "category": classify_provider(provider_line),
+                    "gpu_count": 8, "price_per_hour": price, "price_per_gpu_hour": round(price/8,4)})
     seen = set()
     unique = []
     for r in records:
@@ -126,30 +89,22 @@ def scrape_gpu_prices() -> pd.DataFrame:
         if key not in seen:
             seen.add(key)
             unique.append(r)
+    print(f"Found {len(unique)} GPU price records")
+    return unique
 
-    print(f"Scraped {len(unique)} GPU price records for {TODAY}")
-    return pd.DataFrame(unique)
-
-
-# ── Fetch NVDA stock ───────────────────────────────────────────────────────────
-def fetch_nvda() -> pd.DataFrame:
+def fetch_nvda():
     print("Fetching NVDA stock data...")
-    # Determine start date
     start = "2023-01-01"
     if NVDA_CSV.exists():
         existing = pd.read_csv(NVDA_CSV)
-        if not existing.empty:
-            start = existing["date"].max()  # Only fetch from last stored date
-
+        if not existing.empty: start = existing["date"].max()
     try:
         ticker = yf.Ticker("NVDA")
         df = ticker.history(start=start, auto_adjust=True)
-        if df.empty:
-            print("No NVDA data returned")
-            return pd.DataFrame()
+        if df.empty: return pd.DataFrame()
         df.index = df.index.tz_localize(None)
-        df = df[["Open", "High", "Low", "Close", "Volume"]].reset_index()
-        df.columns = ["date", "open", "high", "low", "close", "volume"]
+        df = df[["Open","High","Low","Close","Volume"]].reset_index()
+        df.columns = ["date","open","high","low","close","volume"]
         df["date"] = df["date"].dt.date.astype(str)
         print(f"Fetched {len(df)} NVDA trading days")
         return df
@@ -157,9 +112,7 @@ def fetch_nvda() -> pd.DataFrame:
         print(f"ERROR fetching NVDA: {e}")
         return pd.DataFrame()
 
-
-# ── Save to CSV (append, no duplicates) ───────────────────────────────────────
-def save_csv(new_df: pd.DataFrame, path: Path, key_cols: list[str]):
+def save_csv(new_df, path, key_cols):
     DATA_DIR.mkdir(exist_ok=True)
     if path.exists():
         existing = pd.read_csv(path)
@@ -170,17 +123,16 @@ def save_csv(new_df: pd.DataFrame, path: Path, key_cols: list[str]):
     combined.to_csv(path, index=False)
     print(f"Saved {len(combined)} total rows to {path}")
 
-
-# ── Main ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    gpu_df = scrape_gpu_prices()
-    if not gpu_df.empty:
-        save_csv(gpu_df, GPU_CSV, key_cols=["date", "provider", "gpu_count"])
-    else:
-        print("WARNING: No GPU data scraped today")
-
+    try:
+        records = scrape_with_playwright()
+        if records:
+            save_csv(pd.DataFrame(records), GPU_CSV, key_cols=["date","provider","gpu_count"])
+        else:
+            print("WARNING: No GPU data scraped")
+    except Exception as e:
+        print(f"ERROR in GPU scrape: {e}")
     nvda_df = fetch_nvda()
     if not nvda_df.empty:
         save_csv(nvda_df, NVDA_CSV, key_cols=["date"])
-
     print("Done!")
