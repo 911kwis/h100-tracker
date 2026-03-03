@@ -1,15 +1,11 @@
 """
-scrape_to_csv.py — Run by GitHub Actions daily.
-Scrapes Neo-Cloud and Hyperscaler H100 index prices from silicondata.com
+scrape_to_csv.py
 """
-
 import pandas as pd
 from pathlib import Path
 from datetime import date
 import re
 import yfinance as yf
-import requests
-from bs4 import BeautifulSoup
 
 DATA_DIR = Path("data")
 GPU_CSV = DATA_DIR / "gpu_prices.csv"
@@ -17,126 +13,95 @@ NVDA_CSV = DATA_DIR / "nvda_prices.csv"
 TODAY = date.today().isoformat()
 TARGET_URL = "https://www.silicondata.com/products/silicon-index"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
 
-
-def scrape_with_requests() -> list[dict]:
-    """Try plain requests first (faster, no timeout issues)."""
-    print("Trying plain HTTP fetch...")
-    try:
-        resp = requests.get(TARGET_URL, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        text = soup.get_text()
-        # Look for prices in range $1-$10 (H100 GPU/hr range)
-        prices = re.findall(r'\b(\d+\.\d{2})\b', text)
-        results = []
-        for p in prices:
-            val = float(p)
-            if 1.0 <= val <= 10.0:
-                results.append(val)
-        print(f"Found candidate prices: {results[:5]}")
-        return results
-    except Exception as e:
-        print(f"Plain fetch failed: {e}")
-        return []
-
-
-def scrape_with_playwright() -> list[dict]:
-    """Use Playwright with faster load strategy."""
+def scrape_with_playwright():
     from playwright.sync_api import sync_playwright
-
+    from bs4 import BeautifulSoup
     records = []
-    price_re = re.compile(r'\b(\d+\.\d{2})\b')
-
     print(f"Launching browser for {TARGET_URL}...")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            extra_http_headers={"Cookie": "cookieconsent_status=allow; CookieConsent=true"}
         )
         page = context.new_page()
-
-        # Use "load" instead of "networkidle" — much faster
+        page.route("**/*.{png,jpg,jpeg,gif,webp,woff,woff2,ttf}", lambda r: r.abort())
         try:
             page.goto(TARGET_URL, wait_until="load", timeout=45000)
-            page.wait_for_timeout(5000)
         except Exception as e:
-            print(f"Page load warning: {e}")
+            print(f"Load warning: {e}")
+        for selector in ["button:has-text(\"Accept\")", "button:has-text(\"Allow\")", "button:has-text(\"OK\")", "[id*=accept]"]:
+            try:
+                page.locator(selector).first.click(timeout=2000)
+                print(f"Dismissed cookie banner")
+                page.wait_for_timeout(2000)
+                break
+            except:
+                pass
+        page.wait_for_timeout(6000)
 
-        content = page.content()
-        text = BeautifulSoup(content, "html.parser").get_text()
+        def extract_price(html):
+            text = BeautifulSoup(html, "html.parser").get_text(" ")
+            print(f"Page text sample: {text[:800]}")
+            for pat in [r"\$(\d+\.\d{2})", r"(\d+\.\d{2})\s*USD", r"(?:^|\s)(\d\.\d{2})(?:\s|$)"]:
+                matches = re.findall(pat, text)
+                valid = [float(x) for x in matches if 1.0 <= float(x) <= 10.0]
+                if valid:
+                    return valid[0]
+            all_d = re.findall(r"\b(\d+\.\d{2})\b", text)
+            valid = [float(x) for x in all_d if 1.0 <= float(x) <= 10.0]
+            return valid[0] if valid else None
 
-        print("Page loaded. Scanning for prices...")
-        print(f"Page text sample: {text[:500]}")
-
-        # Find all decimal numbers in H100 price range
-        prices = re.findall(r'\b(\d+\.\d{2})\b', text)
-        valid = [float(x) for x in prices if 1.0 <= float(x) <= 10.0]
-        print(f"Candidate prices found: {valid[:10]}")
-
-        # Try clicking Hyperscaler tab too
-        hyper_price = None
+        neo = extract_price(page.content())
+        if neo:
+            records.append({"date": TODAY, "provider": "Neo-Cloud Index", "category": "Neo-Cloud",
+                "gpu_count": 1, "price_per_hour": neo, "price_per_gpu_hour": neo})
+            print(f"Neo-Cloud: ${neo}")
+        else:
+            print("No Neo-Cloud price found")
         try:
             page.get_by_text("Hyperscaler").first.click()
-            page.wait_for_timeout(2000)
-            hyper_text = BeautifulSoup(page.content(), "html.parser").get_text()
-            hyper_prices = [float(x) for x in re.findall(r'\b(\d+\.\d{2})\b', hyper_text) if 1.0 <= float(x) <= 10.0]
-            if hyper_prices:
-                hyper_price = hyper_prices[0]
-                print(f"Hyperscaler price: ${hyper_price}")
+            page.wait_for_timeout(3000)
+            hyper = extract_price(page.content())
+            if hyper:
+                records.append({"date": TODAY, "provider": "Hyperscaler Index", "category": "Hyperscaler",
+                    "gpu_count": 1, "price_per_hour": hyper, "price_per_gpu_hour": hyper})
+                print(f"Hyperscaler: ${hyper}")
         except Exception as e:
             print(f"Hyperscaler tab: {e}")
-
         browser.close()
-
-        if valid:
-            records.append({
-                "date": TODAY, "provider": "Neo-Cloud Index", "category": "Neo-Cloud",
-                "gpu_count": 1, "price_per_hour": valid[0], "price_per_gpu_hour": valid[0],
-            })
-        if hyper_price:
-            records.append({
-                "date": TODAY, "provider": "Hyperscaler Index", "category": "Hyperscaler",
-                "gpu_count": 1, "price_per_hour": hyper_price, "price_per_gpu_hour": hyper_price,
-            })
-
     print(f"Scraped {len(records)} records")
     return records
 
 
-def fetch_nvda() -> pd.DataFrame:
-    print("Fetching NVDA stock data...")
+def fetch_nvda():
+    print("Fetching NVDA...")
     start = "2023-01-01"
     if NVDA_CSV.exists():
-        existing = pd.read_csv(NVDA_CSV)
-        if not existing.empty:
-            start = existing["date"].max()
+        ex = pd.read_csv(NVDA_CSV)
+        if not ex.empty:
+            start = ex["date"].max()
     try:
-        ticker = yf.Ticker("NVDA")
-        df = ticker.history(start=start, auto_adjust=True)
+        df = yf.Ticker("NVDA").history(start=start, auto_adjust=True)
         if df.empty:
             return pd.DataFrame()
         df.index = df.index.tz_localize(None)
-        df = df[["Open", "High", "Low", "Close", "Volume"]].reset_index()
-        df.columns = ["date", "open", "high", "low", "close", "volume"]
+        df = df[["Open","High","Low","Close","Volume"]].reset_index()
+        df.columns = ["date","open","high","low","close","volume"]
         df["date"] = df["date"].dt.date.astype(str)
-        print(f"Fetched {len(df)} NVDA trading days")
+        print(f"Fetched {len(df)} NVDA days")
         return df
     except Exception as e:
-        print(f"ERROR: {e}")
+        print(f"NVDA error: {e}")
         return pd.DataFrame()
 
 
 def save_csv(new_df, path, key_cols):
     DATA_DIR.mkdir(exist_ok=True)
     if path.exists():
-        existing = pd.read_csv(path)
-        combined = pd.concat([existing, new_df], ignore_index=True)
-        combined = combined.drop_duplicates(subset=key_cols, keep="last")
+        ex = pd.read_csv(path)
+        combined = pd.concat([ex, new_df], ignore_index=True).drop_duplicates(subset=key_cols, keep="last")
     else:
         combined = new_df
     combined.to_csv(path, index=False)
@@ -147,14 +112,12 @@ if __name__ == "__main__":
     try:
         records = scrape_with_playwright()
         if records:
-            save_csv(pd.DataFrame(records), GPU_CSV, key_cols=["date", "provider"])
+            save_csv(pd.DataFrame(records), GPU_CSV, key_cols=["date","provider"])
         else:
-            print("WARNING: No GPU data scraped")
+            print("WARNING: No GPU data")
     except Exception as e:
         print(f"ERROR: {e}")
-
-    nvda_df = fetch_nvda()
-    if not nvda_df.empty:
-        save_csv(nvda_df, NVDA_CSV, key_cols=["date"])
-
+    nvda = fetch_nvda()
+    if not nvda.empty:
+        save_csv(nvda, NVDA_CSV, key_cols=["date"])
     print("Done!")
