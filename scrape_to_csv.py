@@ -143,7 +143,9 @@ if __name__ == "__main__":
             records.append({"date":TODAY,"provider":result["provider"],"category":result["category"],
                 "gpu_count":1,"price_per_hour":result["price"],"price_per_gpu_hour":result["price"]})
     print(f"\nTotal: {len(records)} providers scraped")
-    for r in records: print(f"  {r[\'provider\']} ({r[\'category\']}): ${r[\'price_per_gpu_hour\']}/GPU/hr")
+    for r in records:
+    name, cat, price = r['provider'], r['category'], r['price_per_gpu_hour']
+    print(f"  {name} ({cat}): ${price}/GPU/hr")
     if records:
         save_csv(pd.DataFrame(records), GPU_CSV, key_cols=["date","provider"])
     else:
