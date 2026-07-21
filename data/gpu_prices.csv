@@ -416,3 +416,6 @@ date,provider,category,gpu_count,price_per_hour,price_per_gpu_hour
 2026-07-20,RunPod,Neo-Cloud,1,2.99,2.99
 2026-07-20,Azure,Hyperscaler,1,1.0702,1.0702
 2026-07-20,GCP,Hyperscaler,1,1.5593,1.5593
+2026-07-21,RunPod,Neo-Cloud,1,2.99,2.99
+2026-07-21,Azure,Hyperscaler,1,1.0702,1.0702
+2026-07-21,GCP,Hyperscaler,1,1.5593,1.5593
